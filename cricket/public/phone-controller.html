@@ -1,0 +1,361 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Phone Bat Controller</title>
+  <style>
+    body { font-family: sans-serif; background: #222; color: #fff; margin: 0; padding: 0; }
+    .container { max-width: 400px; margin: 32px auto; background: #333; border-radius: 16px; padding: 24px; box-shadow: 0 2px 16px #0008; }
+    label { display: block; margin-bottom: 8px; }
+    input[type=text] { width: 100%; padding: 8px; border-radius: 6px; border: none; margin-bottom: 12px; font-size: 1.1rem; }
+    button { padding: 10px 24px; border-radius: 8px; border: none; background: #1976d2; color: #fff; font-size: 1.1rem; cursor: pointer; margin-bottom: 16px; }
+    button:active { background: #1251a3; }
+    .status { margin-bottom: 12px; font-size: 1.1rem; }
+    .sensor { font-size: 1.2rem; margin: 8px 0; }
+    #enableSensors { background: #43a047; margin-bottom: 18px; }
+    #enableSensors:active { background: #2e7031; }
+    .warn { color: #ffb300; font-size: 1.1em; margin-bottom: 10px; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h2>Phone Bat Controller</h2>
+    <label for="wsurl">WebSocket Server (e.g. ws://192.168.1.35:8081):</label>
+    <input type="text" id="wsurl" value="ws://192.168.1.35:8081">
+    <button id="connectBtn">Connect</button>
+    <div class="status" id="status">Not connected</div>
+    <button id="enableSensors">Enable Sensors</button>
+    <button id="calibrateBtn">Calibrate (Set Bat Straight)</button>
+    <button id="testVibrateBtn" style="background:#ff9800;">Test Vibration</button>
+    <button id="throwBallBtn" style="background:#4caf50;">Ball</button>
+    <div class="warn" id="warn"></div>
+    <div class="sensor">alpha: <span id="alpha">0</span></div>
+    <div class="sensor">beta: <span id="beta">0</span></div>
+    <div class="sensor">gamma: <span id="gamma">0</span></div>
+    <div style="margin-top: 20px; padding: 15px; background: #f5f5f5; border-radius: 8px;">
+      <h3>Network Diagnostics</h3>
+      <div id="networkInfo" style="font-family: monospace; font-size: 12px;">
+        Connection Quality: <span id="quality">unknown</span><br>
+        Update Rate: <span id="rate">0</span> Hz<br>
+        Messages Sent: <span id="messages">0</span><br>
+        Last Message: <span id="lastMsg">never</span><br>
+      </div>
+      <button onclick="testLatency()" style="margin-top: 10px;">Test Latency</button>
+      <div id="latencyResult" style="margin-top: 5px; font-size: 12px;"></div>
+    </div>
+  </div>
+  <script>
+    let connected = false;
+    let sensorsEnabled = false;
+    let latest = { alpha: 0, beta: 0, gamma: 0 };
+    let ws = null;
+    let connectionQuality = 'unknown';
+    let messageCount = 0;
+    let lastMessageTime = 0;
+    
+    // UI elements
+    const status = document.getElementById('status');
+    const alphaSpan = document.getElementById('alpha');
+    const betaSpan = document.getElementById('beta');
+    const gammaSpan = document.getElementById('gamma');
+    const warn = document.getElementById('warn');
+
+    // Network optimization
+    function updateConnectionQuality() {
+      if (!ws || ws.readyState !== 1) {
+        connectionQuality = 'disconnected';
+        return;
+      }
+      
+      const now = performance.now();
+      const timeSinceLastMessage = now - lastMessageTime;
+      
+      if (timeSinceLastMessage < 50) {
+        connectionQuality = 'excellent';
+      } else if (timeSinceLastMessage < 100) {
+        connectionQuality = 'good';
+      } else if (timeSinceLastMessage < 200) {
+        connectionQuality = 'fair';
+      } else {
+        connectionQuality = 'poor';
+      }
+      
+      // Update status display
+      const qualityColors = {
+        'excellent': '#4caf50',
+        'good': '#8bc34a',
+        'fair': '#ff9800',
+        'poor': '#f44336',
+        'disconnected': '#9e9e9e'
+      };
+      
+      status.style.color = qualityColors[connectionQuality] || '#9e9e9e';
+      status.textContent = `Connected (${connectionQuality})`;
+    }
+
+    // Adaptive update rate based on connection quality
+    function getUpdateInterval() {
+      switch (connectionQuality) {
+        case 'excellent': return 8;  // 120Hz
+        case 'good': return 16;      // 60Hz
+        case 'fair': return 33;      // 30Hz
+        case 'poor': return 50;      // 20Hz
+        default: return 16;          // 60Hz default
+      }
+    }
+
+    function handleOrientation(e) {
+      latest.alpha = e.alpha || 0;
+      latest.beta = e.beta || 0;
+      latest.gamma = e.gamma || 0;
+      alphaSpan.textContent = latest.alpha.toFixed(1);
+      betaSpan.textContent = latest.beta.toFixed(1);
+      gammaSpan.textContent = latest.gamma.toFixed(1);
+      warn.textContent = "DeviceOrientation event received!";
+    }
+
+    function enableSensors() {
+      warn.textContent = '';
+      let diag = '';
+      diag += 'User agent: ' + navigator.userAgent + '\\n';
+      diag += 'DeviceOrientationEvent: ' + (typeof DeviceOrientationEvent) + '\\n';
+      diag += 'window.ondeviceorientation: ' + (typeof window.ondeviceorientation) + '\\n';
+      if (typeof DeviceOrientationEvent === 'undefined') {
+        warn.textContent = diag + '\\nDeviceOrientationEvent is undefined (not supported on this device/browser).';
+        return;
+      }
+      if (typeof DeviceOrientationEvent.requestPermission === 'function') {
+        // iOS: must request permission
+        DeviceOrientationEvent.requestPermission().then(function(response) {
+          if (response === 'granted') {
+            window.addEventListener('deviceorientation', handleOrientation, true);
+            sensorsEnabled = true;
+            warn.textContent = diag + '\\nSensors enabled! Waiting for events...';
+          } else {
+            warn.textContent = diag + '\\nPermission denied for motion sensors.';
+          }
+        }).catch(function() {
+          warn.textContent = diag + '\\nPermission request failed.';
+        });
+      } else {
+        // Android: just add listener
+        window.addEventListener('deviceorientation', handleOrientation, true);
+        sensorsEnabled = true;
+        warn.textContent = diag + '\\nSensors enabled! Waiting for events...';
+        // If no event after 2 seconds, print a warning
+        setTimeout(() => {
+          if (alphaSpan.textContent === '0.0' && betaSpan.textContent === '0.0' && gammaSpan.textContent === '0.0') {
+            warn.textContent += '\\nNo deviceorientation events received after 2 seconds. Your device or browser may not support it, or permission is blocked.';
+          }
+        }, 2000);
+      }
+    }
+
+    document.getElementById('enableSensors').onclick = enableSensors;
+
+    // Try to auto-enable on Android (no permission needed)
+    window.onload = function() {
+      if (!/iPhone|iPad|iPod/i.test(navigator.userAgent)) {
+        enableSensors();
+      }
+    };
+
+    document.getElementById('connectBtn').onclick = function() {
+      const url = document.getElementById('wsurl').value.trim();
+      if (ws) ws.close();
+      ws = new WebSocket(url);
+      
+      ws.onopen = () => { 
+        connected = true; 
+        connectionQuality = 'good';
+        status.textContent = 'Connected (good)'; 
+        status.style.color = '#8bc34a'; 
+      };
+      
+      ws.onclose = () => { 
+        connected = false; 
+        connectionQuality = 'disconnected';
+        status.textContent = 'Disconnected'; 
+        status.style.color = '#f44336'; 
+      };
+      
+      ws.onerror = () => { 
+        connected = false; 
+        connectionQuality = 'disconnected';
+        status.textContent = 'Connection error'; 
+        status.style.color = '#f44336'; 
+      };
+    };
+
+    // Adaptive data sending with connection quality monitoring
+    let lastSentData = null;
+    let updateInterval = null;
+    
+    function startDataSending() {
+      if (updateInterval) clearInterval(updateInterval);
+      
+      const interval = getUpdateInterval();
+      updateInterval = setInterval(() => {
+        if (connected && ws && ws.readyState === 1 && sensorsEnabled) {
+          // Only send if data has changed significantly (reduce unnecessary messages)
+          const currentData = {
+            alpha: Math.round(latest.alpha * 10) / 10, // Round to 1 decimal
+            beta: Math.round(latest.beta * 10) / 10,
+            gamma: Math.round(latest.gamma * 10) / 10
+          };
+          
+          // Check if data has changed significantly
+          if (!lastSentData || 
+              Math.abs(currentData.alpha - lastSentData.alpha) > 0.5 ||
+              Math.abs(currentData.beta - lastSentData.beta) > 0.5 ||
+              Math.abs(currentData.gamma - lastSentData.gamma) > 0.5) {
+            
+            // Use compact JSON format
+            const message = JSON.stringify(currentData);
+            ws.send(message);
+            lastSentData = currentData;
+            lastMessageTime = performance.now();
+            messageCount++;
+          }
+        }
+      }, interval);
+    }
+    
+    // Monitor connection quality and adjust update rate
+    setInterval(() => {
+      updateConnectionQuality();
+      if (connected && sensorsEnabled) {
+        startDataSending(); // Restart with new interval if needed
+      }
+      
+      // Update network diagnostics
+      document.getElementById('quality').textContent = connectionQuality;
+      document.getElementById('rate').textContent = Math.round(1000 / getUpdateInterval());
+      document.getElementById('messages').textContent = messageCount;
+      document.getElementById('lastMsg').textContent = lastMessageTime ? 
+        Math.round(performance.now() - lastMessageTime) + 'ms ago' : 'never';
+    }, 1000);
+
+    // Latency test function
+    function testLatency() {
+      if (!connected || !ws || ws.readyState !== 1) {
+        document.getElementById('latencyResult').textContent = 'Not connected';
+        return;
+      }
+      
+      const startTime = performance.now();
+      const testMessage = JSON.stringify({ type: 'ping', timestamp: startTime });
+      
+      ws.send(testMessage);
+      
+      // Listen for pong response
+      const originalOnMessage = ws.onmessage;
+      ws.onmessage = function(event) {
+        try {
+          const data = JSON.parse(event.data);
+          if (data.type === 'pong') {
+            const latency = performance.now() - data.timestamp;
+            document.getElementById('latencyResult').textContent = 
+              `Latency: ${latency.toFixed(1)}ms`;
+            ws.onmessage = originalOnMessage; // Restore original handler
+          }
+        } catch (e) {
+          ws.onmessage = originalOnMessage; // Restore original handler
+        }
+      };
+      
+      // Timeout after 1 second
+      setTimeout(() => {
+        if (ws.onmessage !== originalOnMessage) {
+          document.getElementById('latencyResult').textContent = 'Timeout';
+          ws.onmessage = originalOnMessage;
+        }
+      }, 1000);
+    }
+
+    // Calibrate button logic
+    document.getElementById('calibrateBtn').onclick = function() {
+      if (connected && ws && ws.readyState === 1 && sensorsEnabled) {
+        ws.send(JSON.stringify({
+          type: 'calibrate',
+          alpha: Math.round(latest.alpha * 10) / 10,
+          beta: Math.round(latest.beta * 10) / 10,
+          gamma: Math.round(latest.gamma * 10) / 10
+        }));
+        warn.textContent = 'Calibration sent!';
+      }
+    };
+
+    // Listen for vibrate messages and vibrate the phone
+    function handleVibrationMessage(data) {
+      if (!('vibrate' in navigator)) return;
+      if (typeof data.power !== 'number') return;
+      // Vibration pattern based on shot type and power
+      let pattern = 0;
+      let duration = Math.round(80 + 220 * data.power); // 80-300ms
+      if (data.shotType === 'power') {
+        pattern = [duration, 40, duration]; // double strong pulse
+      } else if (data.shotType === 'drive') {
+        pattern = [duration]; // single medium pulse
+      } else if (data.shotType === 'flick') {
+        pattern = [duration * 0.7, 30, duration * 0.5]; // quick double
+      } else {
+        pattern = [duration * 0.5]; // short tap
+      }
+      navigator.vibrate(pattern);
+    }
+
+    // Robust WebSocket message handler for vibration
+    function wrapWebSocketOnMessage(ws, origHandler) {
+      return function(event) {
+        let handled = false;
+        try {
+          const data = JSON.parse(event.data);
+          if (data.type === 'vibrate') {
+            handleVibrationMessage(data);
+            handled = true;
+          }
+        } catch (e) {}
+        if (!handled && typeof origHandler === 'function') origHandler.call(ws, event);
+      };
+    }
+
+    // Patch after connect
+    document.getElementById('connectBtn').addEventListener('click', () => {
+      setTimeout(() => {
+        if (ws) ws.onmessage = wrapWebSocketOnMessage(ws, ws.onmessage);
+      }, 300);
+    });
+
+    document.getElementById('testVibrateBtn').onclick = function() {
+      let debugMsg = '';
+      debugMsg += 'User agent: ' + navigator.userAgent + '\n';
+      if (!('vibrate' in navigator)) {
+        debugMsg += 'Vibration API not supported on this device/browser.';
+        warn.textContent = debugMsg;
+        return;
+      }
+      try {
+        // Test pattern: strong double pulse
+        const didVibrate = navigator.vibrate([180, 40, 180]);
+        if (didVibrate === false) {
+          debugMsg += 'Vibration API call was rejected by the browser.';
+        } else {
+          debugMsg += 'Vibration test triggered! If your phone did not vibrate, check browser/device support and settings.';
+        }
+      } catch (e) {
+        debugMsg += 'Vibration API error: ' + e;
+      }
+      warn.textContent = debugMsg;
+    };
+
+    // Ball button logic
+    document.getElementById('throwBallBtn').onclick = function() {
+      if (connected && ws && ws.readyState === 1) {
+        ws.send(JSON.stringify({ type: 'throwBall' }));
+      }
+    };
+  </script>
+</body>
+</html> 
